@@ -1,7 +1,4 @@
-# Yolo Deep-Ag Copilot: Autonomous Agricultural Intelligence System
-
-**Production Verification Status**: Verified (Feb 2026)  
-**System Version**: 1.2.0
+# TerraMind: Autonomous Agricultural Intelligence System
 
 ---
 
@@ -13,7 +10,7 @@ Farmers in Yolo County operate in a high-stakes environment where decision-makin
 
 ### Solution
 
-**Deep-Ag Copilot** (AgriBot) is a multimodal agricultural intelligence system. It unifies satellite telemetry, weather forecasting, and vector-searchable agronomic research into a single conversational interface. Farmers can query the system via **Voice** (Phone/PSTN) or **Text** (Web Dashboard).
+**TerraMind** is a multimodal agricultural intelligence system. It unifies satellite telemetry, weather forecasting, and vector-searchable agronomic research into a single conversational interface. Farmers can query the system via **Voice** (Phone/PSTN) or **Text** (Web Dashboard).
 
 ### Domain Constraints
 
