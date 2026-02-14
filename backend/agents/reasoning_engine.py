@@ -22,6 +22,12 @@ from services.market import MarketService
 from services.session import session_manager
 from config import settings
 
+# Morph LLM integration (additive)
+try:
+    from services.morph_service import morph_service
+except ImportError:
+    morph_service = None
+
 # Initialize new services
 geocoding_service = GeocodingService()
 market_service = MarketService()
@@ -45,6 +51,9 @@ class AgentResponse:
     query: str = ""
     timestamp: str = ""
     processing_time_ms: int = 0
+    # Morph LLM fields (additive)
+    morph_difficulty: Optional[str] = None
+    morph_warpgrep_results: Optional[List[Dict]] = None
 
 
 class ReasoningEngine:
@@ -58,6 +67,7 @@ class ReasoningEngine:
         self.geocoding = geocoding_service
         self.market = market_service
         self.session = session_manager
+        self.morph = morph_service  # Morph integration (can be None)
         self.chemicals = []
         try:
             chem_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "chemicals.json")
@@ -182,6 +192,12 @@ class ReasoningEngine:
         if optimization_target == "time" or any(k in question_type for k in ["harvest", "planting", "weather"]):
             gdd_task = self.weather.get_growing_degree_days(final_lat, final_lon)
             tasks.append(gdd_task)
+        
+        # Morph: Add Router classification task (runs in parallel)
+        morph_router_task = None
+        if self.morph and self.morph.enabled:
+            morph_router_task = self.morph.classify_difficulty(query)
+            tasks.append(morph_router_task)
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         weather_data = results[0] if not isinstance(results[0], Exception) else None
@@ -203,10 +219,31 @@ class ReasoningEngine:
         gdd_data = None
         if gdd_task:
             gdd_data = results[current_idx] if len(results) > current_idx and not isinstance(results[current_idx], Exception) else None
+            current_idx += 1
+        
+        # Morph: Extract router classification
+        morph_difficulty = None
+        if morph_router_task:
+            router_result = results[current_idx] if len(results) > current_idx and not isinstance(results[current_idx], Exception) else None
+            if router_result:
+                morph_difficulty = router_result.difficulty
+                print(f"[Morph Router] Query difficulty: {morph_difficulty}")
+            current_idx += 1
             
         chemical_data = []
         if "chemical" in question_type or "pest" in question_type or is_regulatory:
             chemical_data = self._lookup_chemicals(query, final_crop)
+        
+        # Morph: WarpGrep supplementary search (run after parallel fetch, uses 1-3 API calls)
+        warpgrep_results = None
+        if self.morph and self.morph.enabled:
+            try:
+                warpgrep_result = await self.morph.warpgrep_search(query)
+                if warpgrep_result.success and warpgrep_result.contexts:
+                    warpgrep_results = warpgrep_result.contexts
+                    print(f"[Morph WarpGrep] Found {len(warpgrep_results)} supplementary contexts")
+            except Exception as wg_err:
+                print(f"[Morph WarpGrep] Error (non-fatal): {wg_err}")
             
         # 8. Synthesis & Generation
         # Inject GDD into weather context
@@ -214,20 +251,42 @@ class ReasoningEngine:
         if gdd_data:
             weather_context_str += f"\nGrowing Degree Days (GDD): {gdd_data}"
             
+        # Build supplementary context from WarpGrep (if available)
+        warpgrep_context = ""
+        if warpgrep_results:
+            warpgrep_texts = []
+            for ctx in warpgrep_results[:3]:  # Limit to top 3
+                warpgrep_texts.append(f"[WarpGrep: {ctx.get('file', 'unknown')}] {ctx.get('content', '')[:500]}")
+            warpgrep_context = "\n".join(warpgrep_texts)
+        
+        # Combine RAG + WarpGrep context
+        combined_rag_context = self._format_rag(rag_results)
+        if warpgrep_context:
+            combined_rag_context += f"\n\nADDITIONAL RESEARCH (AI Search):\n{warpgrep_context}"
+        
         llm_resp = await self.llm.generate_agricultural_response(
             query=query,
             crop=final_crop,
             weather_context=weather_context_str,
             satellite_context=self._format_satellite(satellite_data),
-            rag_context=self._format_rag(rag_results),
+            rag_context=combined_rag_context,
             market_context=self._format_market(market_data),
             chemical_context=self._format_chemicals(chemical_data),
-            history=session.history
+            history=session.history,
+            memory_state={
+                "crop": session.crop,
+                "location": display_address or session.location_label,
+                "key_facts": session.key_facts,
+                "advisor_points": session.advisor_points
+            }
         )
         
-        # Save interaction
+        # Save interaction (store full assistant content so follow-ups have richer context)
         self.session.add_message(session_id, "user", query)
-        self.session.add_message(session_id, "assistant", llm_resp.voice_summary)
+        self.session.add_message(session_id, "assistant", llm_resp.text)
+
+        # Update long-term memory without extra LLM calls
+        self.session.update_memory(session_id, user_text=query, assistant_text=llm_resp.text, crop=final_crop, location_label=display_address)
         
         processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
         
@@ -251,7 +310,9 @@ class ReasoningEngine:
             lon=final_lon,
             query=query,
             timestamp=datetime.now().isoformat(),
-            processing_time_ms=processing_time
+            processing_time_ms=processing_time,
+            morph_difficulty=morph_difficulty,
+            morph_warpgrep_results=warpgrep_results
         )
 
     def _create_ask_response(self, extract_intent: Dict, question: str) -> AgentResponse:
@@ -310,7 +371,7 @@ class ReasoningEngine:
         
     def _format_rag(self, results) -> str:
         if not results: return "No research found."
-        return "\\n".join([f"- {r.text} [Source: {r.source}]" for r in results])
+        return " ".join([f"{r.text} [Source: {r.source}]" for r in results])
 
     def _format_market(self, m: Dict) -> str:
         if not m or not m.get("available"): return "Market unavailable."
